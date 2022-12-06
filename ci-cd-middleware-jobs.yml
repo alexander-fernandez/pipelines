@@ -1,0 +1,67 @@
+parameters:
+  - name: openshiftServiceName
+    type: string
+  - name: openshiftProjectName
+    type: string
+  - name: service
+    type: string
+  - name: sonarServiceName
+    type: string
+    default: 'SonarQube'
+  - name: environment
+    type: string
+  - name: javaVersion
+    type: string
+
+jobs:
+  - job: ${{ format('BuildDeployServiceJob_{0}', replace(replace(parameters.service, '-', '_'), '.', '_')) }}
+    displayName: 'Building service ${{ parameters.service }}'
+    steps:
+      - template: /steps/middleware/ci-middleware.yml@bpr-azure-build-pipeline
+        parameters:
+          sonarServiceName: ${{ parameters.sonarServiceName }}
+          projectName: ${{ parameters.service }}
+          openshiftServiceName: ${{ parameters.openshiftServiceName }} 
+          openshiftProjectName: ${{ parameters.openshiftProjectName }}     
+          imageTag: $(Build.BuildNumber)
+          environment: ${{ parameters.environment }}
+          javaVersion: ${{ parameters.javaVersion }}
+      
+  - job: ${{ format('DeployServiceJob_{0}', replace(replace(parameters.service, '-', '_'), '.', '_')) }}
+    displayName: 'Deploying service ${{ parameters.service }}'
+    dependsOn: 
+      - ${{ format('BuildDeployServiceJob_{0}', replace(replace(parameters.service, '-', '_'), '.', '_')) }}
+    steps:
+      - template: /steps/middleware/cd-middleware.yml@bpr-azure-build-pipeline
+        parameters:
+          openshiftServiceName: ${{ parameters.openshiftServiceName }}
+          openshiftProjectName: ${{ parameters.openshiftProjectName }}
+          projectName: ${{ parameters.service }}
+          imageTag: $(Build.BuildNumber)
+          environment: ${{ parameters.environment }}
+          javaVersion: ${{ parameters.javaVersion }}
+
+  
+  - job: ${{ format('WaitForScanResults_{0}', replace(replace(parameters.service, '-', '_'), '.', '_')) }}
+    displayName: 'Wait for Scan result'
+    pool: Server
+    dependsOn: 
+      - ${{ format('DeployServiceJob_{0}', replace(replace(parameters.service, '-', '_'), '.', '_')) }}
+    steps:
+      - task: Delay@1
+        inputs:
+          delayForMinutes: '5'
+        condition: and(succeeded(), eq( '${{ parameters.openshiftServiceName }}' , 'OpenshiftTest'))
+      
+
+  - job: ${{ format('ScanServiceJob__{0}', replace(replace(parameters.service, '-', '_'), '.', '_')) }}
+    displayName: 'scan image service ${{ parameters.service }}'
+    dependsOn:
+      - ${{ format('WaitForScanResults_{0}', replace(replace(parameters.service, '-', '_'), '.', '_')) }}
+    steps:
+      - template: /steps/azure-defender-scan.yml@bpr-azure-build-pipeline
+        parameters:
+          openshiftServiceName: ${{ parameters.openshiftServiceName }}
+          openshiftProjectName: ${{ parameters.openshiftProjectName }}
+          projectName: ${{ parameters.service }}
+          imageTag: $(Build.BuildNumber)

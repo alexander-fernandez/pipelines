@@ -1,0 +1,163 @@
+parameters:
+  - name: openshiftServiceName
+    type: string
+  - name: openshiftProjectName
+    type: string
+  - name: projectName
+    type: string
+  - name: sourceDirectory
+    type: string
+    default: '$(Build.SourcesDirectory)'
+  - name: imageTag
+    type: string
+    default: 'latest'
+  - name: openshiftRegistryUrl
+    type: string
+    default: 'default-route-openshift-image-registry.apps.test.aro.kcbgroup.com'
+  - name: azureRegistryUrl
+    type: string
+    default: 'arokcb.azurecr.io'
+  - name: environment
+    type: string
+  - name: javaVersion
+    type: string
+
+steps:
+  - task: oc-setup@2
+    displayName: 'Preparing OpenShift tooling for ${{ parameters.openshiftServiceName }}'
+    inputs:
+      connectionType: 'OpenShift Connection Service'
+      openshiftService: ${{ parameters.openshiftServiceName }}
+
+  - task: oc-cmd@2
+    displayName: 'Switching to project ${{ parameters.openshiftProjectName }} in environment ${{ parameters.openshiftServiceName }}'
+    inputs:
+      connectionType: 'OpenShift Connection Service'
+      openshiftService: ${{ parameters.openshiftServiceName }}
+      cmd: 'oc project ${{ parameters.openshiftProjectName }}'
+
+  - task: Maven@3
+    displayName: 'Packaging artifact for ${{ parameters.projectName }}'
+    inputs:
+      mavenPomFile: '${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/pom.xml'
+      mavenOptions: '-Xmx1024m'
+      mavenVersionOption: Default
+      javaHomeOption: path
+      jdkDirectory: ${{ parameters.javaVersion }}
+      options: '--settings ${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/configuration/settings.xml'
+      goals: 'clean package -DskipTests'
+
+  - task: AzureAppConfiguration@3
+    displayName: Infra shared pull variables
+    inputs:
+      azureSubscription: 'aro-kcbdevops-azure'
+      ConfigstoreName: 'arokcb'
+      KeyFilter: 'infra/shared/*'
+      Label: ${{ parameters.environment }}
+      TrimKeyPrefix: 'infra/shared/'
+  
+  - task: AzureAppConfiguration@3
+    displayName: Project pull variables
+    inputs:
+      azureSubscription: 'aro-kcbdevops-azure'
+      ConfigstoreName: 'arokcb'
+      KeyFilter: '*'
+      Label: ${{ parameters.environment }}
+
+  - task: replacetokens@3
+    displayName: Replace tokens
+    inputs:
+      rootDirectory: '${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/'
+      targetFiles: |
+        **/*.yml
+        **/*.yaml
+      encoding: 'auto'
+      writeBOM: false
+      actionOnMissing: 'continue'
+      keepToken: true
+      tokenPrefix: '##'
+      tokenSuffix: '##'
+      useLegacyPattern: false
+      enableTransforms: false
+      enableTelemetry: true
+
+  - task: replacetokens@3
+    displayName: Replace tokens
+    inputs:
+      rootDirectory: '${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/'
+      targetFiles: pom.xml
+      encoding: 'auto'
+      writeBOM: false
+      actionOnMissing: 'continue'
+      keepToken: true
+      tokenPrefix: '(_'
+      tokenSuffix: ')'
+      useLegacyPattern: false
+      enableTransforms: false
+      enableTelemetry: true
+
+  - task: Docker@2
+    displayName: 'Docker Login RedhatDocker'
+    inputs:
+      containerRegistry: 'RedhatDocker'
+      command: 'login'
+
+  - task: Maven@3
+    displayName: 'Generate resources ${{ parameters.projectName }}:${{ parameters.imageTag }}'
+    inputs:
+      mavenPomFile: '${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/pom.xml'
+      mavenOptions: '-Xmx1024m'
+      mavenVersionOption: Default
+      javaHomeOption: path
+      jdkDirectory: /usr/lib/jvm/java-11-openjdk-amd64
+      options: '--settings ${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/configuration/settings.xml'
+      goals: 'oc:resource -Ppopenshift-deployment -DskipTests -Djkube.generator.spring-boot.name=${{ parameters.azureRegistryUrl }}/${{ parameters.openShiftProjectName }}/${{ parameters.projectName }}:${{ parameters.imageTag }}'
+   
+  - task: Maven@3
+    displayName: 'Generating Helm ${{ parameters.projectName }}:${{ parameters.imageTag }}'
+    inputs:
+      mavenPomFile: '${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/pom.xml'
+      mavenOptions: '-Xmx1024m'
+      mavenVersionOption: Default
+      javaHomeOption: path
+      jdkDirectory: /usr/lib/jvm/java-11-openjdk-amd64
+      options: '-X --settings ${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/configuration/settings.xml'
+      goals: 'oc:helm -Ppopenshift-deployment -DskipTests -Djkube.generator.spring-boot.name=${{ parameters.azureRegistryUrl }}/${{ parameters.openShiftProjectName }}/${{ parameters.projectName }}:${{ parameters.imageTag }}'
+
+  - task: HelmInstaller@0
+    displayName: 'Install Helm'
+    inputs:
+      helmVersion: '2.14.1'
+      installKubectl: false
+  
+  - task: Bash@3
+    displayName: 'Generating Helm Template ${{ parameters.projectName }}:${{ parameters.imageTag }}'
+    inputs:
+      targetType: 'inline'
+      script: |
+        cd ${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/target/jkube/helm/${{ parameters.projectName }}/openshift
+        helm template ${{ parameters.projectName }} . > ${{ parameters.projectName }}.yml
+        cat ${{ parameters.projectName }}.yml
+
+  - task: oc-cmd@2
+    displayName: 'Deploying ${{ parameters.projectName }} to project ${{ parameters.openshiftProjectName }}'
+    inputs:
+      connectionType: 'OpenShift Connection Service'
+      openshiftService: ${{ parameters.openshiftServiceName }}      
+      cmd: 'oc apply -f ${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/target/jkube/helm/${{ parameters.projectName }}/openshift/${{ parameters.projectName }}.yml -n ${{ parameters.openshiftProjectName }}'
+
+  # - task: Bash@3
+  #   displayName: 'Applying deployment ${{ parameters.projectName }}:${{ parameters.imageTag }}'
+  #   inputs:
+  #     targetType: 'inline'
+  #     script: |
+  #       helm install ${{ parameters.projectName }} ${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/target/jkube/helm/${{ parameters.projectName }}/openshift -n ${{ parameters.openshiftProjectName }} || \
+  #       helm upgrade ${{ parameters.projectName }} ${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/target/jkube/helm/${{ parameters.projectName }}/openshift -n ${{ parameters.openshiftProjectName }}
+
+  - task: Bash@3
+    displayName: 'Removing unused images'
+    inputs:
+      targetType: 'inline'
+      script: |
+        docker image prune -a -f
+        df -h

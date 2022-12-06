@@ -1,0 +1,161 @@
+parameters:
+  - name: projectName
+    type: string
+  - name: sonarServiceName
+    type: string
+    default: 'SonarQube'
+  # - name: openshiftProjectName
+  #   type: string
+  - name: goals
+    type: string
+    default: 'clean install'
+  - name: sourceDirectory
+    type: string
+    default: '$(Build.SourcesDirectory)'
+  - name: openshiftServiceName
+    type: string
+    default: OpenshiftDev
+  - name: imageTag
+    type: string
+    default: 'latest'
+  - name: azureRegistryUrl
+    type: string
+    default: 'arokcb.azurecr.io'
+  - name: javaVersion
+    type: string
+  - name: environment
+    type: string
+
+
+steps:
+  - task: SonarQubePrepare@4
+    displayName: 'Preparing Sonar tooling'
+    inputs:
+      SonarQube: '${{ parameters.sonarServiceName }}'
+      scannerMode: Other
+  
+  - task: oc-cmd@2
+    displayName: 'Openshift logout'
+    inputs:
+      connectionType: 'OpenShift Connection Service'
+      openshiftService: '${{ parameters.openshiftServiceName }}'
+      cmd: 'logout'
+
+  - task: Maven@3
+    displayName: 'Running build, unit test and code quality analysis for project ${{ parameters.projectName }}'
+    inputs:
+      mavenPomFile: '${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/pom.xml'
+      mavenVersionOption: Default
+      publishJUnitResults: true
+      testResultsFiles: '${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/**/TEST-*.xml'
+      codeCoverageToolOption: JaCoCo
+      javaHomeOption: path
+      jdkDirectory: ${{ parameters.javaVersion }}
+      sonarQubeRunAnalysis: true
+      isJacocoCoverageReportXML: true
+      sqMavenPluginVersionChoice: latest
+      checkStyleRunAnalysis: false
+      pmdRunAnalysis: false
+      findBugsRunAnalysis: false
+      options: '--settings ${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/configuration/settings.xml -Dsonar.tfvc.collectionuri=NA'
+      goals: '${{ parameters.goals }}'
+
+  - task: PublishCodeCoverageResults@1
+    displayName: 'Publishing coverage analysis'
+    inputs:
+      codeCoverageTool: 'JaCoCo'
+      summaryFileLocation: '${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/**/jacoco.xml'
+      reportDirectory: '${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/target/site/jacoco'
+      additionalCodeCoverageFiles: '${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/target/coverage-reports/final.exec'
+      failIfCoverageEmpty: false
+
+  - task: SonarQubePublish@4
+    displayName: 'Publishing Sonar analysis'
+    inputs:
+      pollingTimeoutSec: '300'
+
+  - task: AzureCLI@1
+    displayName: 'Uploading OWASP dependency test report to AZ storage'
+    inputs:
+      azureSubscription: 'Microsoft Azure Enterprise(49888eab-91d7-41bb-bcfb-c1d2cff9cf9a)'
+      scriptLocation: inlineScript
+      inlineScript: |
+        az storage blob upload-batch \
+          --destination '$web' \
+          --destination-path 'build/$(Build.BuildNumber)/dependency-check' \
+          --account-name 'arokcb' \
+          --source "${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/target"
+
+  - task: Bash@3
+    displayName: 'Publishing OWASP test report location'
+    inputs:
+      targetType: 'inline'
+      script: |
+        echo "Reports available at https://arokcb.z6.web.core.windows.net/build/$(Build.BuildNumber)/dependency-check/dependency-check-report.html"
+  
+  - task: Docker@2
+    displayName: 'Docker Login RedhatDocker'
+    inputs:
+      containerRegistry: 'RedhatDocker'
+      command: 'login'
+
+  - task: Bash@3
+    displayName: 'Changing files'
+    inputs:
+      targetType: 'inline'
+      script: |                     
+        sed -i -e 's|##image##|${{ parameters.projectName }}:${{ parameters.imageTag }}|g' ${{ parameters.projectName }}/pom.xml
+  
+  - task: AzureAppConfiguration@3
+    displayName: Project pull variables
+    inputs:
+      azureSubscription: 'aro-kcbdevops-azure'
+      ConfigstoreName: 'arokcb'
+      KeyFilter: '*'
+      Label: ${{ parameters.environment }}
+
+  - task: replacetokens@3
+    displayName: Replace tokens
+    inputs:
+      rootDirectory: '${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/'
+      targetFiles: pom.xml
+      encoding: 'auto'
+      writeBOM: false
+      actionOnMissing: 'continue'
+      keepToken: true
+      tokenPrefix: '(_'
+      tokenSuffix: ')'
+      useLegacyPattern: false
+      enableTransforms: false
+      enableTelemetry: true
+
+  - task: Maven@3
+    displayName: 'Building image ${{ parameters.projectName }}:${{ parameters.imageTag }}'
+    inputs:
+      mavenPomFile: '${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/pom.xml'
+      mavenOptions: '-Xmx1024m'
+      mavenVersionOption: Default
+      javaHomeOption: path
+      jdkDirectory: ${{ parameters.javaVersion }}
+      options: '-X --settings ${{ parameters.sourceDirectory }}/${{ parameters.projectName }}/configuration/settings.xml'
+      goals: 'k8s:build -Popenshift-deployment -DskipTests -Djkube.generator.spring-boot.name=${{ parameters.projectName }}:${{ parameters.imageTag }}'
+
+  - task: Docker@2
+    displayName: 'Docker Login arokcb'
+    inputs:
+      containerRegistry: 'arokcb'
+      command: 'login'
+
+  - task: Bash@3
+    displayName: 'Tagging image ${{ parameters.azureRegistryUrl }}/${{ parameters.openshiftProjectName }}/${{ parameters.projectName }}:${{ parameters.imageTag }}'
+    inputs:
+      targetType: 'inline'
+      script: |
+        docker --config $(Pipeline.Workspace) tag ${{ parameters.projectName }}:${{ parameters.imageTag }} ${{ parameters.azureRegistryUrl }}/${{ parameters.openShiftProjectName }}/${{ parameters.projectName }}:${{ parameters.imageTag }}
+        
+  - task: Bash@3
+    displayName: 'Docker Push ${{ parameters.azureRegistryUrl }}/${{ parameters.projectName }}:${{ parameters.imageTag }}'
+    inputs:
+      targetType: 'inline'
+      script: |
+        docker push ${{ parameters.azureRegistryUrl }}/${{ parameters.openShiftProjectName }}/${{ parameters.projectName }}:${{ parameters.imageTag }}

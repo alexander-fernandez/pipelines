@@ -1,0 +1,54 @@
+parameters:
+  - name: openshiftServiceName
+    type: string
+  - name: openshiftProjectName
+    type: string
+  - name: e2eProjectName
+    type: string
+  - name: services
+    type: object
+  - name: testGroups
+    type: object
+  - name: environment
+    type: string
+    default: 'DEV'
+  - name: routes
+    type: boolean 
+  - name: javaVersion
+    type: string
+    default: '/usr/lib/jvm/java-11-openjdk-amd64'
+
+stages:
+  - ${{ each service in parameters.services }}:
+    - stage: ${{ format('BuildAndDeploy_{0}', replace(replace(service, '-', '_'), '.', '_')) }}
+      dependsOn: []
+      jobs:
+        - template: /jobs/middleware/ci-cd-middleware-jobs.yml@bpr-azure-build-pipeline
+          parameters:
+            openshiftServiceName: ${{ parameters.openshiftServiceName }}
+            openshiftProjectName: ${{ parameters.openshiftProjectName }}
+            service: ${{ service }}
+            environment: ${{ parameters.environment }}
+            javaVersion: ${{ parameters.javaVersion }}
+    
+  - stage: CreateSecuredRoutes
+    dependsOn: 
+      - ${{ format('BuildAndDeploy_{0}', replace(replace(parameters.services[0], '-', '_'), '.', '_')) }}
+    jobs:
+      - template: /jobs/create-secured-routes.yml@bpr-azure-build-pipeline
+        parameters:
+          openshiftServiceName: ${{ parameters.openshiftServiceName }}
+          openshiftProjectName: ${{ parameters.openshiftProjectName }}
+          routes: ${{ parameters.routes }}
+          environment: ${{ parameters.environment }}
+
+  - stage: EndToEndTest
+    dependsOn: 
+      - CreateSecuredRoutes
+    jobs:
+      - template: /jobs/e2etest-service.yml@bpr-azure-build-pipeline
+        parameters:
+          projectName: ${{ parameters.e2eProjectName }}
+          testGroups: ${{ parameters.testGroups }}
+          e2eProfile: 'dev'
+          javaVersion: ${{ parameters.javaVersion }}
